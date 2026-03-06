@@ -20,7 +20,7 @@ from sklearn.metrics import mean_absolute_error, r2_score
 # ── Config ─────────────────────────────────────────────────────────────────────
 DATA_PATH   = "nba_data/final/nba_ml_dataset.csv"
 OUTPUT_DIR  = "models"
-N_PLAYERS   = 5
+N_PLAYERS   = 10
 RANDOM_SEED = 1
 
 TRAIN_SEASONS = list(range(2016, 2024))   # 2016–2023 inclusive
@@ -144,10 +144,15 @@ model.fit(
 )
 
 # ── Evaluate ───────────────────────────────────────────────────────────────────
-def report(label, X, y, df_rows):
-    preds   = model.predict(X)
-    mae     = mean_absolute_error(y, preds)
-    r2      = r2_score(y, preds)
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
+import numpy as np
+
+# ── Evaluate ───────────────────────────────────────────────────────────────────
+def report(label, X, y, df_rows, plot=False):
+    preds = model.predict(X)
+    mae   = mean_absolute_error(y, preds)
+    r2    = r2_score(y, preds)
     print(f"\n  ── {label} ──────────────────────────────────────")
     print(f"     MAE : {mae:.2f} wins")
     print(f"     R²  : {r2:.3f}")
@@ -157,9 +162,86 @@ def report(label, X, y, df_rows):
     print(results.sort_values("error", key=abs, ascending=False)
                  .to_string(index=False))
 
+    # ── Chart ─────────────────────────────────────────────────────────────────
+    if not plot:
+        return
+    plot_data = sorted(zip(results["team"], results["reg_season_wins"],
+                           results["predicted"]), key=lambda x: x[2])
+    teams     = [d[0] for d in plot_data]
+    actual    = np.array([d[1] for d in plot_data])
+    predicted = np.array([d[2] for d in plot_data])
+    x         = np.arange(len(teams))
+
+    BG_COLOR      = "#0d1117"
+    PANEL_COLOR   = "#161b22"
+    GRID_COLOR    = "#21262d"
+    ACTUAL_COLOR  = "#3fb950"
+    PREDICT_COLOR = "#f85149"
+    TEXT_COLOR    = "#e6edf3"
+    SUBTEXT_COLOR = "#8b949e"
+
+    fig, ax = plt.subplots(figsize=(20, 9))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(PANEL_COLOR)
+
+    # Dotted connecting lines
+    for i in range(len(teams)):
+        ax.plot([x[i], x[i]], [predicted[i], actual[i]],
+                color="white", alpha=0.35, linewidth=1.4,
+                linestyle=(0, (3, 3)), zorder=2)
+
+    # Dots
+    ax.scatter(x, predicted, color=PREDICT_COLOR, s=90, zorder=4,
+               edgecolors="white", linewidths=0.6)
+    ax.scatter(x, actual,    color=ACTUAL_COLOR,  s=90, zorder=4,
+               edgecolors="white", linewidths=0.6)
+
+    # Grid & spines
+    ax.set_axisbelow(True)
+    ax.yaxis.grid(True, color=GRID_COLOR, linewidth=0.8, linestyle="--")
+    ax.xaxis.grid(False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(colors=SUBTEXT_COLOR, length=0)
+
+    # Axes
+    ax.set_xticks(x)
+    ax.set_xticklabels(teams, rotation=45, ha="right",
+                       fontsize=9.5, color=TEXT_COLOR, fontfamily="monospace")
+    ax.set_ylabel("Wins", color=TEXT_COLOR, fontsize=12, labelpad=10)
+    ax.yaxis.set_tick_params(labelcolor=SUBTEXT_COLOR, labelsize=10)
+    ax.set_xlim(-0.7, len(teams) - 0.3)
+    ax.set_ylim(0, max(actual.max(), predicted.max()) + 8)
+
+    # Titles
+    fig.text(0.5, 0.97, f"NBA {label.strip()} — Actual vs Expected Wins",
+             ha="center", va="top", fontsize=18, fontweight="bold", color=TEXT_COLOR)
+    fig.text(0.5, 0.925,
+             f"Sorted by expected wins  ·  MAE: {mae:.2f}  ·  R²: {r2:.3f}",
+             ha="center", va="top", fontsize=10, color=SUBTEXT_COLOR)
+
+    # Legend
+    pred_handle = mlines.Line2D([], [], color=PREDICT_COLOR, marker='o',
+                                markersize=8, linestyle='None',
+                                markeredgecolor='white', markeredgewidth=0.6,
+                                label='Expected Wins')
+    act_handle  = mlines.Line2D([], [], color=ACTUAL_COLOR, marker='o',
+                                markersize=8, linestyle='None',
+                                markeredgecolor='white', markeredgewidth=0.6,
+                                label='Actual Wins')
+    ax.legend(handles=[pred_handle, act_handle], loc="upper left",
+              framealpha=0.2, facecolor=PANEL_COLOR,
+              edgecolor=GRID_COLOR, labelcolor=TEXT_COLOR, fontsize=10)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    safe_label = label.strip().replace(" ", "_").replace("/", "-")
+    plt.savefig(f"report_{safe_label}.png", dpi=160,
+                bbox_inches="tight", facecolor=BG_COLOR)
+    plt.show()
+
 print("\n══ Evaluation ══════════════════════════════════════════")
 report("Train (2016-2023)", X_train, y_train, df_clean[train_mask])
-report("Val   (2024)",      X_val,   y_val,   df_clean[val_mask])
+report("Val   (2024)",      X_val,   y_val,   df_clean[val_mask], plot=True)
 
 # Test — only run once you're satisfied with val performance
 # if len(X_test) > 0:
