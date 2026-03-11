@@ -1,32 +1,16 @@
 """
-NBA ML Dataset Collector
-=========================
-Builds an ML-ready dataset for predicting team wins from player combinations.
+NBA ML Dataset Collector — Step 1: Player Stats
+================================================
+Collects player totals + advanced stats for all team-seasons and saves to:
+    nba_data/final/nba_ml_dataset.csv
 
-Data sources:
-  - https://api.server.nbaapi.com  — player totals + advanced stats (BBRef-sourced)
-  - https://site.api.espn.com      — standings (regular season wins/losses)
-
-Y (targets):
-    reg_season_wins, reg_losses
-
-X (features):
-    - Top 10 players by minutes played per team-season
-      Each player: all fields returned by playeradvancedstats + playertotals
-      No hardcoded feature list — uses whatever the API returns
-    - Team-level aggregates computed from the top-10 player pool
+Run this first, then run nba_physical_collector.py to append physical attributes.
 
 Install:
     pip install requests pandas numpy
 
 Usage:
-    python nba_ml_collector.py
-
-Output:
-    nba_data/
-        raw/        - Cached JSON per season (standings + season rows)
-        final/
-            nba_ml_dataset.csv
+    python nba_stats_collector.py
 """
 
 import requests
@@ -41,12 +25,12 @@ from datetime import datetime
 # ─────────────────────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────────────
-SEASONS_BACK   = 10    # How many seasons to collect
-CURRENT_SEASON = 2025  # Most recent season end-year (2025 = 2024-25)
-TOP_N_PLAYERS  = 10    # Players per row — sorted by minutesPlayed descending
-MIN_GAMES      = 10    # Minimum games played (filters 10-day contracts)
+FIRST_SEASON   = 2018  # Adjust down if probe confirms earlier seasons work
+CURRENT_SEASON = 2018
+TOP_N_PLAYERS  = 10
+MIN_GAMES      = 10
 OUTPUT_DIR     = "nba_data"
-RATE_LIMIT_SEC = 1.0   # Seconds between API requests
+RATE_LIMIT_SEC = 1.0
 # ─────────────────────────────────────────────────────────────
 
 RAW_DIR   = os.path.join(OUTPUT_DIR, "raw")
@@ -54,51 +38,69 @@ FINAL_DIR = os.path.join(OUTPUT_DIR, "final")
 for d in [RAW_DIR, FINAL_DIR]:
     os.makedirs(d, exist_ok=True)
 
-SEASONS = list(range(CURRENT_SEASON - SEASONS_BACK + 1, CURRENT_SEASON + 1))
+SEASONS = list(range(FIRST_SEASON, CURRENT_SEASON + 1))
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Accept': 'application/json',
 }
 
-# ESPN team abbreviations → ESPN team IDs (as used in standings API)
 ESPN_TEAM_IDS = {
     'ATL': '1',  'BOS': '2',  'BKN': '17', 'CHA': '30', 'CHI': '4',
     'CLE': '5',  'DAL': '6',  'DEN': '7',  'DET': '8',  'GS':  '9',
     'HOU': '10', 'IND': '11', 'LAC': '12', 'LAL': '13', 'MEM': '29',
-    'MIA': '14', 'MIL': '15', 'MIN': '16', 'NO': '3',  'NY':  '18',
+    'MIA': '14', 'MIL': '15', 'MIN': '16', 'NO':  '3',  'NY':  '18',
     'OKC': '25', 'ORL': '19', 'PHI': '20', 'PHX': '21', 'POR': '22',
     'SAC': '23', 'SA':  '24', 'TOR': '28', 'UTAH': '26','WSH': '27',
 }
 
-# ESPN abbrev → nbaapi.com/BBRef abbrev (used for player stat API calls)
-ESPN_TO_NBAAPI = {
-    'GS':   'GSW',
-    'NY':   'NYK',
-    'SA':   'SAS',
-    'UTAH': 'UTA',
-    'WSH':  'WAS',
-    'BKN':  'BRK',
-    'CHA':  'CHO',
-    'PHX':  'PHO',
-    'NO':   'NOP',
+HISTORICAL_ABBREVS = {
+    'BKN':  [(2013, 9999, 'BRK'), (2001, 2012, 'NJN')],
+    'CHA':  [(2015, 9999, 'CHO'), (2005, 2014, 'CHA'), (2001, 2002, 'CHH')],
+    'NO':   [(2014, 9999, 'NOP'), (2008, 2013, 'NOH'), (2006, 2007, 'NOK'), (2003, 2005, 'NOH')],
+    'MEM':  [(2002, 9999, 'MEM'), (2001, 2001, 'VAN')],
+    'OKC':  [(2009, 9999, 'OKC'), (2001, 2008, 'SEA')],
+    'WSH':  [(2001, 9999, 'WAS')],
+    'GS':   [(2001, 9999, 'GSW')],
+    'NY':   [(2001, 9999, 'NYK')],
+    'SA':   [(2001, 9999, 'SAS')],
+    'UTAH': [(2001, 9999, 'UTA')],
+    'PHX':  [(2001, 9999, 'PHO')],
 }
 
-# nbaapi.com abbrev → ESPN abbrev (used when looking up standings)
-NBAAPI_TO_ESPN = {v: k for k, v in ESPN_TO_NBAAPI.items()}
+ESPN_TO_NBAAPI_CURRENT = {
+    'GS': 'GSW', 'NY': 'NYK', 'SA': 'SAS', 'UTAH': 'UTA',
+    'WSH': 'WAS', 'BKN': 'BRK', 'CHA': 'CHO', 'PHX': 'PHO', 'NO': 'NOP',
+    'NJN': 'NJ'
+}
 
-ALL_TEAMS = list(ESPN_TEAM_IDS.keys())
-
-# Columns to drop before embedding — internal keys not useful as ML features
 DROP_COLS = {'id', 'playerId', '_team', '_season', 'isPlayoff', 'season', 'team'}
 
 
+def espn_to_bbref(espn_abbrev: str, season: int) -> str:
+    if espn_abbrev in HISTORICAL_ABBREVS:
+        for (first, last, bbref) in HISTORICAL_ABBREVS[espn_abbrev]:
+            if first <= season <= last:
+                return bbref
+    return ESPN_TO_NBAAPI_CURRENT.get(espn_abbrev, espn_abbrev)
+
+
+def get_active_teams(season: int) -> list:
+    active = []
+    for espn in ESPN_TEAM_IDS:
+        if espn == 'CHA' and season == 2004:
+            continue
+        if espn == 'NO' and season < 2003:
+            continue
+        active.append(espn)
+    return active
+
+
 # ═══════════════════════════════════════════════════════════════
-#  HTTP HELPER
+#  HTTP
 # ═══════════════════════════════════════════════════════════════
 
-def safe_get(url: str, params: dict = None, retries: int = 3) -> dict | None:
-    """GET with retry — mirrors the pattern from your ESPN win prob scraper."""
+def safe_get(url: str, params: dict = None, retries: int = 3):
     for attempt in range(retries):
         try:
             resp = requests.get(url, headers=HEADERS, params=params, timeout=20)
@@ -119,76 +121,53 @@ def safe_get(url: str, params: dict = None, retries: int = 3) -> dict | None:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  SOURCE 1: nbaapi.com — player stats
+#  PLAYER STATS
 # ═══════════════════════════════════════════════════════════════
 
-def get_player_totals(team: str, season: int) -> pd.DataFrame:
-    """
-    Per-game totals for all players on a team-season.
-    Fields: playerName, position, age, games, gamesStarted, minutesPg,
-            fieldGoals, fieldAttempts, fieldPercent, threeFg, threeAttempts,
-            threePercent, twoFg, twoAttempts, twoPercent, effectFgPercent,
-            ft, ftAttempts, ftPercent, offensiveRb, defensiveRb, totalRb,
-            assists, steals, blocks, turnovers, personalFouls, points
-    """
-    nbaapi_team = ESPN_TO_NBAAPI.get(team, team)
+def get_player_totals(espn_team: str, season: int) -> pd.DataFrame:
+    bbref_team = espn_to_bbref(espn_team, season)
     data = safe_get(
         "https://api.server.nbaapi.com/api/playertotals",
-        params={'season': season, 'team': nbaapi_team, 'pageSize': 30, 'page': 1}
+        params={'season': season, 'team': bbref_team, 'pageSize': 50, 'page': 1}
     )
-    if not data or 'data' not in data:
+    if not data or not data.get('data'):
         return pd.DataFrame()
     df = pd.DataFrame(data['data'])
-    df['_team']   = team
+    df['_team']   = espn_team
     df['_season'] = season
     return df
 
 
-def get_player_advanced(team: str, season: int) -> pd.DataFrame:
-    """
-    Advanced stats for all players on a team-season.
-    Fields: playerName, position, age, games, minutesPlayed, per, tsPercent,
-            threePAR, ftr, offensiveRBPercent, defensiveRBPercent,
-            totalRBPercent, assistPercent, stealPercent, blockPercent,
-            turnoverPercent, usagePercent, offensiveWS, defensiveWS,
-            winShares, winSharesPer, obpm, dbpm, bpm, vorp
-    """
-    nbaapi_team = ESPN_TO_NBAAPI.get(team, team)
+def get_player_advanced(espn_team: str, season: int) -> pd.DataFrame:
+    bbref_team = espn_to_bbref(espn_team, season)
     data = safe_get(
         "https://api.server.nbaapi.com/api/playeradvancedstats",
-        params={'season': season, 'team': nbaapi_team, 'pageSize': 30, 'page': 1}
+        params={'season': season, 'team': bbref_team, 'pageSize': 50, 'page': 1}
     )
-    if not data or 'data' not in data:
+    if not data or not data.get('data'):
         return pd.DataFrame()
     df = pd.DataFrame(data['data'])
-    df['_team']   = team
+    df['_team']   = espn_team
     df['_season'] = season
     return df
 
 
 # ═══════════════════════════════════════════════════════════════
-#  SOURCE 2: ESPN — regular season standings
+#  STANDINGS
 # ═══════════════════════════════════════════════════════════════
 
 def get_espn_standings(season: int) -> dict:
-    """
-    Returns {team_abbrev: {'wins': int, 'losses': int}} for all 30 teams.
-    Cached to disk after first fetch.
-    """
     cache_path = os.path.join(RAW_DIR, f"espn_standings_{season}.json")
     if os.path.exists(cache_path):
         with open(cache_path) as f:
             return json.load(f)
-
     data = safe_get(
         "https://site.api.espn.com/apis/v2/sports/basketball/nba/standings",
         params={'season': season}
     )
-
     standings = {}
     if not data:
         return standings
-
     try:
         for conference in data.get('children', []):
             for entry in conference.get('standings', {}).get('entries', []):
@@ -203,19 +182,41 @@ def get_espn_standings(season: int) -> dict:
                     standings[abbrev] = {'wins': wins, 'losses': losses}
     except Exception as e:
         print(f"    [WARN] standings parse error season {season}: {e}")
-
     with open(cache_path, 'w') as f:
         json.dump(standings, f)
-
     return standings
 
 
+def lookup_standing(espn_team: str, season: int, standings: dict) -> tuple:
+    overrides = {
+        'NO':   ['NO', 'NOP', 'NOH', 'NOK'],
+        'GS':   ['GS', 'GSW'],
+        'NY':   ['NY', 'NYK'],
+        'SA':   ['SA', 'SAS'],
+        'UTAH': ['UTAH', 'UTA'],
+        'WSH':  ['WSH', 'WAS'],
+        'BKN':  ['BKN', 'BRK', 'NJN'],
+        'CHA':  ['CHA', 'CHO', 'CHH'],
+        'MEM':  ['MEM', 'VAN'],
+        'OKC':  ['OKC', 'SEA'],
+        'PHX':  ['PHX', 'PHO'],
+    }
+    candidates = list(dict.fromkeys(
+        overrides.get(espn_team, [espn_team]) +
+        [espn_team, espn_to_bbref(espn_team, season)]
+    ))
+    for key in candidates:
+        if key in standings:
+            r = standings[key]
+            return int(r.get('wins', -1)), int(r.get('losses', -1))
+    return -1, -1
+
+
 # ═══════════════════════════════════════════════════════════════
-#  CLEANING & MERGING
+#  CLEANING
 # ═══════════════════════════════════════════════════════════════
 
 def filter_min_games(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop players with fewer than MIN_GAMES (removes 10-day contracts)."""
     if df.empty:
         return df
     games_col = next((c for c in df.columns if c.lower() in ('games', 'g', 'gp')), None)
@@ -227,34 +228,22 @@ def filter_min_games(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def merge_totals_and_advanced(tot: pd.DataFrame, adv: pd.DataFrame) -> pd.DataFrame:
-    """
-    Outer join totals + advanced on playerName + _team + _season.
-    Drops duplicate non-key columns from advanced to avoid _x/_y suffixes.
-    """
     if tot.empty and adv.empty:
         return pd.DataFrame()
     if tot.empty:
         return adv
     if adv.empty:
         return tot
-
     join_keys = [k for k in ['playerName', '_team', '_season']
                  if k in tot.columns and k in adv.columns]
-
     overlap = (set(tot.columns) & set(adv.columns)) - set(join_keys)
     adv_slim = adv.drop(columns=list(overlap), errors='ignore')
-
     return tot.merge(adv_slim, on=join_keys, how='outer')
 
 
 def sort_and_trim(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Sort by minutesPlayed descending, keep top TOP_N_PLAYERS.
-    Falls back to minutesPg if minutesPlayed not present.
-    """
     if df.empty:
         return df
-
     minutes_col = next(
         (c for c in df.columns if c.lower() in ('minutesplayed', 'minutespg', 'mp', 'min')),
         None
@@ -263,12 +252,11 @@ def sort_and_trim(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         df[minutes_col] = pd.to_numeric(df[minutes_col], errors='coerce')
         df = df.sort_values(minutes_col, ascending=False)
-
     return df.head(TOP_N_PLAYERS).reset_index(drop=True)
 
 
 # ═══════════════════════════════════════════════════════════════
-#  ML ROW BUILDER
+#  ROW BUILDER
 # ═══════════════════════════════════════════════════════════════
 
 def safe_float(val) -> float:
@@ -280,7 +268,6 @@ def safe_float(val) -> float:
 
 
 def gini(arr: np.ndarray) -> float:
-    """Usage concentration — high = star-driven offense, low = balanced."""
     arr = arr[~np.isnan(arr)]
     if len(arr) < 2:
         return np.nan
@@ -292,42 +279,21 @@ def gini(arr: np.ndarray) -> float:
 
 
 def get_feature_cols(df: pd.DataFrame) -> list:
-    """
-    Return all columns from the merged player dataframe that are
-    useful ML features — everything except internal/identifier cols.
-    """
-    return [c for c in df.columns
-            if c not in DROP_COLS and c != 'playerName']
+    return [c for c in df.columns if c not in DROP_COLS and c != 'playerName']
 
 
-def build_ml_row(team: str, season: int,
-                 player_df: pd.DataFrame,
-                 reg_wins: int, reg_losses: int) -> dict:
-    """
-    Flatten one team-season into a single ML-ready dict.
-
-    Structure:
-      season, team                         — metadata
-      reg_season_wins, reg_losses          — targets
-      team_*                               — team aggregates
-      p1_name, p1_<feat>, p1_<feat>...    — top player by minutes
-      p2_name, p2_<feat>, ...             — second player
-      ...up to p{TOP_N_PLAYERS}
-    """
+def build_ml_row(team, season, player_df, reg_wins, reg_losses) -> dict:
     row = {
         'season':          season,
         'team':            team,
         'reg_season_wins': reg_wins   if reg_wins   >= 0 else np.nan,
         'reg_losses':      reg_losses if reg_losses >= 0 else np.nan,
     }
-
     if player_df.empty:
         return row
 
-    # Determine feature columns from actual API response
     feature_cols = get_feature_cols(player_df)
 
-    # ── Embed each player slot ──
     for i in range(1, TOP_N_PLAYERS + 1):
         slot = f'p{i}'
         if i <= len(player_df):
@@ -336,12 +302,10 @@ def build_ml_row(team: str, season: int,
             for col in feature_cols:
                 row[f'{slot}_{col}'] = safe_float(p.get(col, np.nan))
         else:
-            # Empty slot — fewer than TOP_N_PLAYERS qualified players
             row[f'{slot}_name'] = np.nan
             for col in feature_cols:
                 row[f'{slot}_{col}'] = np.nan
 
-    # ── Team aggregate features ──
     def col_series(name):
         return pd.to_numeric(player_df.get(name, pd.Series(dtype=float)), errors='coerce')
 
@@ -357,35 +321,34 @@ def build_ml_row(team: str, season: int,
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PER-TEAM PIPELINE
+#  PIPELINE
 # ═══════════════════════════════════════════════════════════════
 
-def process_team_season(team: str, season: int, standings: dict) -> dict:
-    print(f"    [{team}] ", end='', flush=True)
+def process_team_season(espn_team: str, season: int, standings: dict) -> dict:
+    bbref_team = espn_to_bbref(espn_team, season)
+    print(f"    [{espn_team}/{bbref_team}] ", end='', flush=True)
 
-    # Fetch both stat tables
-    tot_df = get_player_totals(team, season)
-    adv_df = get_player_advanced(team, season)
+    tot_df = get_player_totals(espn_team, season)
+    adv_df = get_player_advanced(espn_team, season)
 
-    # Merge → filter 10-day → sort by minutes → top 10
+    if tot_df.empty and adv_df.empty:
+        print("NO DATA")
+        reg_wins, reg_losses = lookup_standing(espn_team, season, standings)
+        return {
+            'season': season, 'team': espn_team,
+            'reg_season_wins': reg_wins if reg_wins >= 0 else np.nan,
+            'reg_losses': reg_losses if reg_losses >= 0 else np.nan,
+        }
+
     players = merge_totals_and_advanced(tot_df, adv_df)
     players = filter_min_games(players)
     players = sort_and_trim(players)
 
-    # Standings are keyed by ESPN abbrev — convert if needed
-    espn_key  = NBAAPI_TO_ESPN.get(team, team)
-    standing  = standings.get(espn_key, standings.get(team, {}))
-    reg_wins   = int(standing.get('wins',   -1))
-    reg_losses = int(standing.get('losses', -1))
-
-    row = build_ml_row(team, season, players, reg_wins, reg_losses)
-    print(f"{reg_wins}W / {reg_losses}L  |  {len(players)} players ✓")
+    reg_wins, reg_losses = lookup_standing(espn_team, season, standings)
+    row = build_ml_row(espn_team, season, players, reg_wins, reg_losses)
+    print(f"{reg_wins}W / {reg_losses}L  |  {len(players)} players")
     return row
 
-
-# ═══════════════════════════════════════════════════════════════
-#  SEASON ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════
 
 def collect_season(season: int) -> list:
     cache_path = os.path.join(RAW_DIR, f"season_{season}_rows.json")
@@ -394,19 +357,18 @@ def collect_season(season: int) -> list:
         with open(cache_path) as f:
             return json.load(f)
 
+    active_teams = get_active_teams(season)
     print(f"\n{'='*60}")
-    print(f"  Season {season-1}-{str(season)[-2:]}  |  {len(ALL_TEAMS)} teams")
+    print(f"  Season {season-1}-{str(season)[-2:]}  |  {len(active_teams)} teams")
     print(f"{'='*60}")
-
-    print(f"  Fetching ESPN standings...")
+    print("  Fetching ESPN standings...")
     standings = get_espn_standings(season)
     print(f"  Got standings for {len(standings)} teams")
 
     rows = []
-    for team in ALL_TEAMS:
+    for team in active_teams:
         try:
-            row = process_team_season(team, season, standings)
-            rows.append(row)
+            rows.append(process_team_season(team, season, standings))
         except Exception as e:
             print(f"ERROR — {e}")
             traceback.print_exc()
@@ -414,20 +376,14 @@ def collect_season(season: int) -> list:
 
     with open(cache_path, 'w') as f:
         json.dump(rows, f, default=str)
-
     return rows
 
 
-# ═══════════════════════════════════════════════════════════════
-#  DATASET ASSEMBLY
-# ═══════════════════════════════════════════════════════════════
-
 def build_dataset():
     print("\n" + "="*60)
-    print("  NBA ML Dataset Builder")
-    print(f"  Seasons : {SEASONS[0]}-{SEASONS[-1]}  ({len(SEASONS)} seasons)")
-    print(f"  Teams   : {len(ALL_TEAMS)}")
-    print(f"  Top-N   : {TOP_N_PLAYERS} players per row (by minutes played)")
+    print("  NBA ML Dataset Builder — Step 1: Stats")
+    print(f"  Seasons  : {SEASONS[0]}-{SEASONS[-1]}  ({len(SEASONS)} seasons)")
+    print(f"  Top-N    : {TOP_N_PLAYERS} players per row")
     print(f"  Min games: {MIN_GAMES}")
     print("="*60)
 
@@ -435,20 +391,17 @@ def build_dataset():
     for season in SEASONS:
         rows = collect_season(season)
         all_rows.extend(rows)
-        # Incremental save after each season
         pd.DataFrame(all_rows).to_csv(
             os.path.join(RAW_DIR, "interim_dataset.csv"), index=False
         )
 
     df = pd.DataFrame(all_rows)
 
-    # ── Column ordering: meta → targets → team → players ──
     meta_cols   = ['season', 'team']
     target_cols = ['reg_season_wins', 'reg_losses']
     team_cols   = sorted([c for c in df.columns if c.startswith('team_')])
     player_cols = [c for c in df.columns
                    if any(c.startswith(f'p{i}_') for i in range(1, TOP_N_PLAYERS + 1))]
-    # Sort player cols so p1_* all appear together, then p2_*, etc.
     player_cols = sorted(player_cols, key=lambda c: (int(c.split('_')[0][1:]), c))
     other_cols  = [c for c in df.columns
                    if c not in meta_cols + target_cols + team_cols + player_cols]
@@ -458,49 +411,13 @@ def build_dataset():
 
     out_path = os.path.join(FINAL_DIR, "nba_ml_dataset.csv")
     df.to_csv(out_path, index=False)
+    print(f"\n  Saved {len(df)} rows x {len(df.columns)} cols → {out_path}")
+    print(f"  Next: run nba_physical_collector.py to append physical attributes")
     return df, out_path
 
-
-# ═══════════════════════════════════════════════════════════════
-#  SUMMARY
-# ═══════════════════════════════════════════════════════════════
-
-def print_summary(df: pd.DataFrame, path: str):
-    print(f"\n{'='*60}")
-    print("  COMPLETE")
-    print(f"{'='*60}")
-    print(f"  File      : {path}")
-    print(f"  Rows      : {len(df)}")
-    print(f"  Columns   : {len(df.columns)}")
-
-    print(f"\n  Targets:")
-    for col in ['reg_season_wins', 'reg_losses']:
-        if col in df.columns:
-            s = df[col].dropna()
-            if len(s):
-                print(f"    {col:<22} mean={s.mean():.1f}  "
-                      f"min={s.min():.0f}  max={s.max():.0f}  n={len(s)}")
-
-    print(f"\n  Player 1 feature columns:")
-    for c in sorted([c for c in df.columns if c.startswith('p1_')]):
-        print(f"    {c}")
-
-    print(f"\n  Team aggregate columns:")
-    for c in sorted([c for c in df.columns if c.startswith('team_')]):
-        print(f"    {c}")
-
-    print(f"\n  Seasons : {sorted(df['season'].dropna().unique().tolist())}")
-    print(f"{'='*60}")
-    print(f"\n  Load with: pd.read_csv('{path}')")
-
-
-# ═══════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
     t0 = datetime.now()
     print(f"Started: {t0.strftime('%Y-%m-%d %H:%M:%S')}")
-    df, path = build_dataset()
-    print_summary(df, path)
-    print(f"\nElapsed: {datetime.now() - t0}")
+    build_dataset()
+    print(f"Elapsed: {datetime.now() - t0}")
