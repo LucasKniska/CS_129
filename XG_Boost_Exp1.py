@@ -1,12 +1,11 @@
 """
-NBA Win Predictor - XGBoost Training Pipeline
-Run: python train_model.py
-Outputs: models/xgb_model.pkl, models/feature_cols.json
+NBA Win Predictor - XGBoost trained on modern era, tested on old era
+  Train    : seasons 2017-2025  (model trains on these)
+  Validate : seasons 2015-2016  (early stopping / hyperparam tuning)
+  Test     : seasons 2003-2009  (held-out old-era evaluation, touched once)
 
-Splits (from 'split' column in dataset):
-  Train    : split == 0  (model trains on these)
-  Validate : split == 1  (early stopping / hyperparam tuning)
-  Test     : split == 2  (final held-out evaluation, touched once)
+Year column assumed to be named 'year' in the CSV (e.g. 2015 = 2014-15 season).
+Change YEAR_COL below if your column has a different name.
 """
 
 import pandas as pd
@@ -23,11 +22,13 @@ OUTPUT_DIR  = "models"
 N_PLAYERS   = 8
 RANDOM_SEED = 1
 
+# ── Year-based split boundaries ────────────────────────────────────────────────
+YEAR_COL    = "season"          # column in CSV that holds the season year
+TRAIN_YEARS = range(2017, 2026)   # 2017-2025  →  training
+VAL_YEARS   = range(2015, 2017)   # 2015-2016  →  validation / early stopping
+TEST_YEARS  = range(2003, 2010)   # 2003-2009  →  held-out old-era test
+
 # ── Column dropout mask ────────────────────────────────────────────────────────
-# List any per-player stat suffixes you want to DROP across ALL player slots.
-# e.g. ["age", "college", "draft_year"] will drop p1_age, p2_age ... p10_age,
-# p1_college, p2_college ... etc.
-# Leave empty to keep all columns.
 DROP_PLAYER_COLS: list[str] = [
     # ── Admin / non-predictive ──────────────────────────
     "draft_year",
@@ -64,9 +65,6 @@ DROP_PLAYER_COLS: list[str] = [
     # ── Win-derived / outcome stats (heavy leakage) ─────
     "winShares",
     "winSharesPer",
-    # "offensiveWS",
-    # "defensiveWS",
-    # "vorp",
     "box",
     "offensiveBox",
     "defensiveBox",
@@ -78,14 +76,19 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 print("Loading data...")
 df = pd.read_csv(DATA_PATH)
 print(f"  {df.shape[0]} team-seasons, {df.shape[1]} columns")
-print(f"  Teams in file: {sorted(df['team'].unique())}")
-print(f"  Wins range: {df['reg_season_wins'].min()} – {df['reg_season_wins'].max()}")
-print(f"  Split counts:\n{df['split'].value_counts().sort_index().rename({0:'Train(0)', 1:'Val(1)', 2:'Test(2)'}).to_string()}")
+
+# Validate year column exists
+if YEAR_COL not in df.columns:
+    raise ValueError(
+        f"Year column '{YEAR_COL}' not found in CSV. "
+        f"Available columns: {list(df.columns)}"
+    )
+
+print(f"  Years in file : {sorted(df[YEAR_COL].unique())}")
+print(f"  Teams in file : {sorted(df['team'].unique())}")
+print(f"  Wins range    : {df['reg_season_wins'].min()} – {df['reg_season_wins'].max()}")
 
 # ── Detect and remove rows with no player stats ────────────────────────────────
-# Rows where all player stat columns are null are useless for training and
-# would corrupt the model — an all-zero feature vector mapped to a real win
-# total carries no signal.
 stat_cols_check = [
     c for c in df.columns
     if any(c.startswith(f"p{i}_") for i in range(1, N_PLAYERS + 1))
@@ -99,55 +102,67 @@ n_empty       = empty_mask.sum()
 if n_empty > 0:
     print(f"\n⚠  {n_empty} rows have no player stats — excluded from all splits:")
     empty_summary = (df[empty_mask]
-                     .groupby("split")["team"]
+                     .groupby(YEAR_COL)["team"]
                      .apply(list)
                      .reset_index())
     for _, row in empty_summary.iterrows():
         teams   = row["team"]
         preview = ", ".join(teams[:5]) + ("..." if len(teams) > 5 else "")
-        print(f"   Split {int(row['split'])}: {len(teams)} teams ({preview})")
+        print(f"   Year {int(row[YEAR_COL])}: {len(teams)} teams ({preview})")
 else:
     print("\n  No empty rows found ✓")
 
 df_clean = df[complete_mask].copy()
 print(f"\n  Usable rows: {len(df_clean)} (dropped {n_empty})")
 
-# ── Validate all splits are present after cleaning ─────────────────────────────
-for label, split_val in [("Train", 1), ("Val", 2), ("Test", 3)]:
-    count   = (df_clean["split"] == split_val).sum()
-    status  = f"{count} rows ✓" if count > 0 else "⚠  NO ROWS FOUND"
-    print(f"  {label:<6}: split={split_val}  {status}")
+# ── Apply year-based splits ────────────────────────────────────────────────────
+train_mask = df_clean[YEAR_COL].isin(TRAIN_YEARS)
+val_mask   = df_clean[YEAR_COL].isin(VAL_YEARS)
+test_mask  = df_clean[YEAR_COL].isin(TEST_YEARS)
+
+print("\n── Year-based splits ─────────────────────────────────────")
+for label, mask, years in [
+    ("Train",    train_mask, TRAIN_YEARS),
+    ("Validate", val_mask,   VAL_YEARS),
+    ("Test",     test_mask,  TEST_YEARS),
+]:
+    count  = mask.sum()
+    yr_str = f"{min(years)}–{max(years)}"
+    status = f"{count:>3} rows ✓" if count > 0 else "⚠  NO ROWS — check YEAR_COL name/values"
+    print(f"  {label:<9}: years {yr_str}  →  {status}")
+
+# Warn about any years in the CSV that fall outside all three splits
+all_assigned = train_mask | val_mask | test_mask
+unassigned   = df_clean[~all_assigned][YEAR_COL].unique()
+if len(unassigned):
+    print(f"\n  ℹ  Years not assigned to any split (ignored): {sorted(unassigned)}")
+    print(f"     These are 2010–2014 seasons sitting between eras — intentionally excluded.")
 
 # ── Define feature columns ─────────────────────────────────────────────────────
 NAME_COLS = [c for c in df.columns if c.endswith("_name")]
 META_COLS = [
-    "split", "team", "reg_season_wins", "reg_losses",
-    # Team-level aggregates are derived from player stats — excluding prevents
-    # leakage and forces the model to learn from raw individual player data
+    YEAR_COL, "split", "team", "reg_season_wins", "reg_losses",
     "team_avg_bpm", "team_avg_per", "team_max_usg",
     "team_players_qualified", "team_total_vorp",
     "team_total_ws", "team_usg_gini",
 ]
 EXCLUDE = set(META_COLS + NAME_COLS)
 
-# All player slot columns present in the CSV (p1_ through p10_)
 ALL_PLAYER_SLOTS = set(
     c for c in df_clean.columns
     if any(c.startswith(f"p{i}_") for i in range(1, 11))
 )
-# Only keep slots 1..N_PLAYERS; drop higher slots entirely
 ALLOWED_SLOTS = set(
     c for c in ALL_PLAYER_SLOTS
     if any(c.startswith(f"p{i}_") for i in range(1, N_PLAYERS + 1))
 )
 
-# Build per-player dropout set from DROP_PLAYER_COLS mask
 DROPPED_BY_MASK = set()
 if DROP_PLAYER_COLS:
     for suffix in DROP_PLAYER_COLS:
         for i in range(1, N_PLAYERS + 1):
             DROPPED_BY_MASK.add(f"p{i}_{suffix}")
-    print(f"\n  Dropping {len(DROPPED_BY_MASK)} columns via dropout mask: {DROP_PLAYER_COLS}")
+    print(f"\n  Dropping {len(DROPPED_BY_MASK)} columns via dropout mask.")
 
 FEAT_COLS = [
     c for c in df_clean.columns
@@ -159,10 +174,6 @@ FEAT_COLS = [
 print(f"\n  Feature columns: {len(FEAT_COLS)}  (using {N_PLAYERS} player slots)")
 
 # ── Build splits ───────────────────────────────────────────────────────────────
-train_mask = df_clean["split"] == 1
-val_mask   = df_clean["split"] == 2
-test_mask  = df_clean["split"] == 3
-
 X_train = df_clean.loc[train_mask, FEAT_COLS].fillna(0)
 y_train = df_clean.loc[train_mask, "reg_season_wins"]
 
@@ -172,26 +183,25 @@ y_val   = df_clean.loc[val_mask,   "reg_season_wins"]
 X_test  = df_clean.loc[test_mask,  FEAT_COLS].fillna(0)
 y_test  = df_clean.loc[test_mask,  "reg_season_wins"]
 
-print(f"\n  Train  : {len(X_train):>3} rows  (split=1)")
-print(f"  Val    : {len(X_val):>3} rows  (split=2)")
-print(f"  Test   : {len(X_test):>3} rows  (split=3)")
+print(f"\n  Train  : {len(X_train):>3} rows  ({min(TRAIN_YEARS)}–{max(TRAIN_YEARS)})")
+print(f"  Val    : {len(X_val):>3} rows  ({min(VAL_YEARS)}–{max(VAL_YEARS)})")
+print(f"  Test   : {len(X_test):>3} rows  ({min(TEST_YEARS)}–{max(TEST_YEARS)})")
 
 # ── Train XGBoost ──────────────────────────────────────────────────────────────
 print("\nTraining XGBoost...")
 
 model = XGBRegressor(
     random_state=RANDOM_SEED,
-    min_child_weight=15,       
-    max_depth=2,               
-    reg_lambda=8,          
-    reg_alpha=2,          
-    subsample=0.7,            
-    colsample_bytree=0.4,     
-    learning_rate=0.005,      
-    n_estimators=10000,        
+    min_child_weight=15,
+    max_depth=2,
+    reg_lambda=8,
+    reg_alpha=2,
+    subsample=0.7,
+    colsample_bytree=0.4,
+    learning_rate=0.005,
+    n_estimators=10000,
     early_stopping_rounds=300,
 )
-
 
 model.fit(
     X_train, y_train,
@@ -210,20 +220,23 @@ def report(label, X, y, df_rows, plot=False):
     print(f"\n  ── {label} ──────────────────────────────────────")
     print(f"     MAE : {mae:.2f} wins")
     print(f"     R²  : {r2:.3f}")
-    results = df_rows[["split", "team", "reg_season_wins"]].copy()
+
+    results = df_rows[[YEAR_COL, "team", "reg_season_wins"]].copy()
     results["predicted"] = np.round(preds, 1)
     results["error"]     = np.round(preds - y.values, 1)
-    # print(results.sort_values("error", key=abs, ascending=False)
-    #              .to_string(index=False))
 
-    # ── Chart ─────────────────────────────────────────────────────────────────
     if not plot:
         return
-    plot_data = sorted(zip(results["team"], results["reg_season_wins"],
-                           results["predicted"]), key=lambda x: x[2])
-    teams     = [d[0] for d in plot_data]
-    actual    = np.array([d[1] for d in plot_data])
-    predicted = np.array([d[2] for d in plot_data])
+
+    plot_data = sorted(
+        zip(results["team"], results[YEAR_COL],
+            results["reg_season_wins"], results["predicted"]),
+        key=lambda x: x[3]
+    )
+    # Label as "TEAM·YEAR" so duplicate teams across seasons are distinguishable
+    teams     = [f"{d[0]}·{d[1]}" for d in plot_data]
+    actual    = np.array([d[2] for d in plot_data])
+    predicted = np.array([d[3] for d in plot_data])
     x         = np.arange(len(teams))
 
     BG_COLOR      = "#0d1117"
@@ -234,23 +247,20 @@ def report(label, X, y, df_rows, plot=False):
     TEXT_COLOR    = "#e6edf3"
     SUBTEXT_COLOR = "#8b949e"
 
-    fig, ax = plt.subplots(figsize=(20, 9))
+    fig, ax = plt.subplots(figsize=(max(20, len(teams) * 0.45), 9))
     fig.patch.set_facecolor(BG_COLOR)
     ax.set_facecolor(PANEL_COLOR)
 
-    # Dotted connecting lines
     for i in range(len(teams)):
         ax.plot([x[i], x[i]], [predicted[i], actual[i]],
                 color="white", alpha=0.35, linewidth=1.4,
                 linestyle=(0, (3, 3)), zorder=2)
 
-    # Dots
     ax.scatter(x, predicted, color=PREDICT_COLOR, s=90, zorder=4,
                edgecolors="white", linewidths=0.6)
     ax.scatter(x, actual,    color=ACTUAL_COLOR,  s=90, zorder=4,
                edgecolors="white", linewidths=0.6)
 
-    # Grid & spines
     ax.set_axisbelow(True)
     ax.yaxis.grid(True, color=GRID_COLOR, linewidth=0.8, linestyle="--")
     ax.xaxis.grid(False)
@@ -258,23 +268,20 @@ def report(label, X, y, df_rows, plot=False):
         spine.set_visible(False)
     ax.tick_params(colors=SUBTEXT_COLOR, length=0)
 
-    # Axes
     ax.set_xticks(x)
     ax.set_xticklabels(teams, rotation=45, ha="right",
-                       fontsize=9.5, color=TEXT_COLOR, fontfamily="monospace")
+                       fontsize=7, color=TEXT_COLOR, fontfamily="monospace")
     ax.set_ylabel("Wins", color=TEXT_COLOR, fontsize=12, labelpad=10)
     ax.yaxis.set_tick_params(labelcolor=SUBTEXT_COLOR, labelsize=10)
     ax.set_xlim(-0.7, len(teams) - 0.3)
     ax.set_ylim(0, max(actual.max(), predicted.max()) + 8)
 
-    # Titles
     fig.text(0.5, 0.97, f"NBA {label.strip()} — Actual vs Expected Wins",
              ha="center", va="top", fontsize=18, fontweight="bold", color=TEXT_COLOR)
     fig.text(0.5, 0.925,
              f"Sorted by expected wins  ·  MAE: {mae:.2f}  ·  R²: {r2:.3f}",
              ha="center", va="top", fontsize=10, color=SUBTEXT_COLOR)
 
-    # Legend
     pred_handle = mlines.Line2D([], [], color=PREDICT_COLOR, marker='o',
                                 markersize=8, linestyle='None',
                                 markeredgecolor='white', markeredgewidth=0.6,
@@ -294,14 +301,12 @@ def report(label, X, y, df_rows, plot=False):
     plt.show()
 
 print("\n══ Evaluation ══════════════════════════════════════════")
-report("Train (split=1)", X_train, y_train, df_clean[train_mask])
-report("Val   (split=2)", X_val,   y_val,   df_clean[val_mask], plot=True)
+report("Train (2017–2025)", X_train, y_train, df_clean[train_mask])
+report("Val   (2015–2016)", X_val,   y_val,   df_clean[val_mask], plot=True)
 
-if len(X_test) > 0:
-    print("\n  ⚠  Running test evaluation — do this only once!")
-    report("Test  (split=3)", X_test, y_test, df_clean[test_mask])
-else:
-    print("\n  Test set (split=3) not yet available — skipping.")
+# ── Old-era test — uncomment when you're satisfied with val ───────────────────
+print("\n  ⚠  Running old-era test evaluation — do this only once!")
+report("Test (2003–2009)", X_test, y_test, df_clean[test_mask], plot=True)
 
 # ── Feature importance ─────────────────────────────────────────────────────────
 importances = pd.Series(model.feature_importances_, index=FEAT_COLS)
