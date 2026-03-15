@@ -243,6 +243,162 @@ print("\n══ Evaluation ═════════════════�
 report("Train (2016-2023)", X_train, y_train, df_clean[train_mask])
 report("Val   (2024)",      X_val,   y_val,   df_clean[val_mask], plot=True)
 
+# add ESPN predicted wins as a baseline
+# ── Load ESPN predicted wins ────────────────────────────────────────────────
+espn_df = pd.read_csv("nba_data/final/2024_espn_predicted_wins.csv")
+
+# ── Clean column names just in case ─────────────────────────────────────────
+espn_df.columns = espn_df.columns.str.strip()
+
+# ── Keep only what we need for report() ─────────────────────────────────────
+espn_df = espn_df[["season", "team", "espn_pred_wins"]].copy()
+
+# ── Rename ESPN wins so report() can use them like actual wins ──────────────
+espn_df = espn_df.rename(columns={"espn_pred_wins": "reg_season_wins"})
+
+# ── Make sure types match df_clean ───────────────────────────────────────────
+espn_df["season"] = espn_df["season"].astype(int)
+espn_df["team"] = espn_df["team"].astype(str)
+
+# ── Build validation rows in the same order as X_val / y_val ────────────────
+espn_val = (
+    df_clean[val_mask][["season", "team"]]
+    .copy()
+    .merge(espn_df, on=["season", "team"], how="left")
+)
+
+# ── Check for unmatched teams ────────────────────────────────────────────────
+missing = espn_val[espn_val["reg_season_wins"].isna()]
+if len(missing) > 0:
+    print("These teams did not match ESPN predictions:")
+    print(missing.to_string(index=False))
+else:
+    print("All validation teams matched ESPN predictions.")
+
+# ── ESPN predictions as y for report() ──────────────────────────────────────
+y_espn = espn_val["reg_season_wins"]
+
+# ── Run report ───────────────────────────────────────────────────────────────
+report("ESPN Predictions (2024)", X_val, y_espn, espn_val, plot=True)
+
+# espn vs prediction vs actual scatter plot
+def report_with_espn(label, X, y, df_rows, espn_vals, plot=False):
+    preds = model.predict(X)
+
+    mae = mean_absolute_error(y, preds)
+    r2  = r2_score(y, preds)
+
+    print(f"\n  ── {label} ──────────────────────────────────────")
+    print(f"     MAE : {mae:.2f} wins")
+    print(f"     R²  : {r2:.3f}")
+
+    results = df_rows[["season", "team", "reg_season_wins"]].copy()
+    results["model_pred"] = np.round(preds, 1)
+    results["espn_pred"]  = np.round(espn_vals.values, 1)
+    results["error"]      = np.round(preds - y.values, 1)
+
+    print(results.sort_values("error", key=abs, ascending=False)
+                 .to_string(index=False))
+
+    if not plot:
+        return
+
+    # ── Prepare plot data ─────────────────────────────────────────────
+    plot_data = sorted(
+        zip(results["team"], results["reg_season_wins"],
+            results["model_pred"], results["espn_pred"]),
+        key=lambda x: x[2]
+    )
+
+    teams = [d[0] for d in plot_data]
+    actual = np.array([d[1] for d in plot_data])
+    model_pred = np.array([d[2] for d in plot_data])
+    espn_pred = np.array([d[3] for d in plot_data])
+    x = np.arange(len(teams))
+
+    BG_COLOR = "#0d1117"
+    PANEL_COLOR = "#161b22"
+    GRID_COLOR = "#21262d"
+
+    MODEL_COLOR = "#3fb950"   # green
+    ESPN_COLOR = "#58a6ff"    # blue
+    ACTUAL_COLOR = "#f85149"  # red
+
+    TEXT_COLOR = "#e6edf3"
+    SUBTEXT_COLOR = "#8b949e"
+
+    fig, ax = plt.subplots(figsize=(20, 9))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(PANEL_COLOR)
+    
+    # ── Dotted connecting lines ─────────────────────────────────────────
+    for i in range(len(teams)):
+        y_vals = [espn_pred[i], model_pred[i], actual[i]]
+
+        ax.plot(
+            [x[i], x[i]],
+            [min(y_vals), max(y_vals)],
+            color="white",
+            alpha=0.35,
+            linewidth=1.4,
+            linestyle=(0, (3, 3)),
+            zorder=2
+        )
+
+    # ── Scatter points ────────────────────────────────────────────────
+    ax.scatter(x, model_pred, color=MODEL_COLOR, s=90,
+               edgecolors="white", linewidths=0.6, label="Model Prediction")
+
+    ax.scatter(x, espn_pred, color=ESPN_COLOR, s=90,
+               edgecolors="white", linewidths=0.6, label="ESPN Prediction")
+
+    ax.scatter(x, actual, color=ACTUAL_COLOR, s=90,
+               edgecolors="white", linewidths=0.6, label="Actual Wins")
+
+    # ── Grid and axes styling ─────────────────────────────────────────
+    ax.set_axisbelow(True)
+    ax.yaxis.grid(True, color=GRID_COLOR, linewidth=0.8, linestyle="--")
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    ax.tick_params(colors=SUBTEXT_COLOR, length=0)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        teams,
+        rotation=45,
+        ha="right",
+        fontsize=9.5,
+        color=TEXT_COLOR,
+        fontfamily="monospace"
+    )
+
+    ax.set_ylabel("Wins", color=TEXT_COLOR, fontsize=12)
+    ax.set_ylim(0, max(actual.max(), model_pred.max(), espn_pred.max()) + 8)
+
+    # ── Titles ────────────────────────────────────────────────────────
+    fig.text(
+        0.5, 0.97,
+        f"NBA {label.strip()} — Model vs ESPN vs Actual",
+        ha="center", va="top",
+        fontsize=18, fontweight="bold", color=TEXT_COLOR
+    )
+
+    fig.text(
+        0.5, 0.925,
+        f"MAE (model): {mae:.2f}  ·  R²: {r2:.3f}",
+        ha="center", va="top",
+        fontsize=10, color=SUBTEXT_COLOR
+    )
+
+    ax.legend(facecolor=PANEL_COLOR, edgecolor=GRID_COLOR,
+              labelcolor=TEXT_COLOR, fontsize=10)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.show()
+
+report_with_espn("Val (2024)", X_val, y_val, df_clean[val_mask], y_espn,plot=True)
 # Test — only run once you're satisfied with val performance
 # if len(X_test) > 0:
 #     print("\n  ⚠  Running test evaluation — do this only once!")
