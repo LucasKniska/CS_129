@@ -116,7 +116,7 @@ model = Pipeline([
 model.fit(X_train, y_train)
 
 # ── Evaluation function ────────────────────────────────────────────────────────
-def report(label, X, y, df_rows):
+def report(label, X, y, df_rows, plot=False, save_path=None):
     preds = model.predict(X)
 
     mae = mean_absolute_error(y, preds)
@@ -127,17 +127,93 @@ def report(label, X, y, df_rows):
     print(f"R²  : {r2:.3f}")
 
     results = df_rows[["season", "team", "reg_season_wins"]].copy()
-    results["predicted"] = np.round(preds, 1)
-    results["error"]     = np.round(preds - y.values, 1)
+    results["predicted"] = preds
+    results["error"] = preds - y.values
 
-    print(results.sort_values("error", key=abs, ascending=False)
-                 .to_string(index=False))
+    print(
+        results.assign(
+            predicted=np.round(results["predicted"], 1),
+            error=np.round(results["error"], 1)
+        )
+        .sort_values("error", key=abs, ascending=False)
+        .to_string(index=False)
+    )
+
+    if plot:
+        plot_df = results.sort_values("predicted").reset_index(drop=True)
+
+        plt.style.use("dark_background")
+        fig, ax = plt.subplots(figsize=(16, 7))
+
+        x = range(len(plot_df))
+
+        # dashed error lines
+        for i, row in plot_df.iterrows():
+            ax.plot(
+                [i, i],
+                [row["predicted"], row["reg_season_wins"]],
+                linestyle="--",
+                linewidth=1,
+                alpha=0.5,
+                color="gray"
+            )
+
+        # predicted and actual dots
+        ax.scatter(
+            x,
+            plot_df["predicted"],
+            label="Expected Wins",
+            s=40,
+            color="#ff6b6b"
+        )
+        ax.scatter(
+            x,
+            plot_df["reg_season_wins"],
+            label="Actual Wins",
+            s=40,
+            color="#6bdc8b"
+        )
+
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(plot_df["team"], rotation=45, ha="right")
+        ax.set_ylabel("Wins")
+        fig.text(0.5, 0.97, f"NBA {label.strip()} — Actual vs Expected Wins",
+             ha="center", va="top", fontsize=18, fontweight="bold")
+        fig.text(0.5, 0.925,
+                f"Sorted by expected wins  ·  MAE: {mae:.2f}  ·  R²: {r2:.3f}",
+                ha="center", va="top", fontsize=10)
+
+        ax.legend()
+        ax.grid(axis="y", alpha=0.2)
+        plt.tight_layout(rect=[0, 0, 1, 0.88])
+
+        if save_path is not None:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
+        plt.show()
+
+    return results
 
 # ── Evaluate ───────────────────────────────────────────────────────────────────
 print("\n══ Evaluation ══════════════════════════════════════════")
 
-report("Train (2016-2023)", X_train, y_train, df_clean[train_mask])
-report("Val   (2024)",      X_val,   y_val,   df_clean[val_mask])
+report(
+    "NBA Train (2016-2023)",
+    X_train,
+    y_train,
+    df_clean[train_mask],
+    plot=False,
+    save_path="models/linear_regression_train_plot.png"
+)
+
+report(
+    "NBA Val (2024)",
+    X_val,
+    y_val,
+    df_clean[val_mask],
+    plot=True,
+    save_path="models/linear_regression_val_plot.png"
+)
 
 # Predictions for validation set
 val_preds = model.predict(X_val)
