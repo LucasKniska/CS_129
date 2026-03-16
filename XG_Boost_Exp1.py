@@ -1,11 +1,14 @@
 """
-NBA Win Predictor - XGBoost trained on modern era, tested on old era
-  Train    : seasons 2017-2025  (model trains on these)
-  Validate : seasons 2015-2016  (early stopping / hyperparam tuning)
-  Test     : seasons 2003-2009  (held-out old-era evaluation, touched once)
+NBA Win Predictor — Old-Era Generalisation Experiment
+══════════════════════════════════════════════════════
+  Train    : seasons 2016–2023  (same as nba_win_predictor.py)
+  Validate : season  2024       (early stopping — same as nba_win_predictor.py)
+  Test     : seasons 2003–2010  (held-out old-era evaluation, touched once)
 
-Year column assumed to be named 'year' in the CSV (e.g. 2015 = 2014-15 season).
-Change YEAR_COL below if your column has a different name.
+The dropout mask is kept identical to nba_win_predictor.py so that the two
+scripts are directly comparable.  The only addition here is a per-season MAE
+line chart for seasons 2003–2010 so you can see whether the model degrades
+gracefully as the gap to the training era widens.
 """
 
 import pandas as pd
@@ -13,6 +16,8 @@ import numpy as np
 import pickle
 import json
 import os
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 
@@ -23,64 +28,31 @@ N_PLAYERS   = 8
 RANDOM_SEED = 1
 
 # ── Year-based split boundaries ────────────────────────────────────────────────
-YEAR_COL    = "season"          # column in CSV that holds the season year
-TRAIN_YEARS = range(2017, 2026)   # 2017-2025  →  training
-VAL_YEARS   = range(2015, 2017)   # 2015-2016  →  validation / early stopping
-TEST_YEARS  = range(2003, 2010)   # 2003-2009  →  held-out old-era test
+YEAR_COL    = "season"
+TRAIN_YEARS = range(2016, 2024)   # 2016–2023  →  training        ← SYNCED
+VAL_YEARS   = [2024]              # 2024       →  validation       ← SYNCED
+TEST_YEARS  = range(2003, 2011)   # 2003–2010  →  held-out old-era test
 
-# ── Column dropout mask ────────────────────────────────────────────────────────
+# ── Column dropout mask  (identical to nba_win_predictor.py) ──────────────────
 DROP_PLAYER_COLS: list[str] = [
     # ── Admin / non-predictive ──────────────────────────
-    "draft_year",
-    "draft_round",
-    "draft_number",
-    "college",
-    "country",
-
-    # ── Playing time (leakage) ──────────────────────────
-    "games",
-    "gamesStarted",
-    "minutesPlayed",
-    "minutesPg",
-
-    # ── Counting totals (scale with minutes, leak) ──────
-    "assists",
-    "blocks",
-    "steals",
-    "points",
-    "totalRb",
-    "offensiveRb",
-    "defensiveRb",
-    "fieldGoals",
-    "fieldAttempts",
-    "ft",
-    "ftAttempts",
-    "threeAttempts",
-    "threeFg",
-    "twoAttempts",
-    "twoFg",
-    "turnovers",
-    "personalFouls",
-
-    # ── Win-derived / outcome stats (heavy leakage) ─────
-    "winShares",
-    "winSharesPer",
-    "box",
-    "offensiveBox",
-    "defensiveBox",
+    "draft_year", "draft_round", "draft_number", "college", "country",
+    # ── Counting totals (raw volume, scale with minutes) ─
+    "offensiveRb", "defensiveRb", "fieldGoals", "fieldAttempts",
 ]
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ── Load data ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  Load data
+# ══════════════════════════════════════════════════════════════════════════════
 print("Loading data...")
 df = pd.read_csv(DATA_PATH)
 print(f"  {df.shape[0]} team-seasons, {df.shape[1]} columns")
 
-# Validate year column exists
 if YEAR_COL not in df.columns:
     raise ValueError(
-        f"Year column '{YEAR_COL}' not found in CSV. "
+        f"Year column '{YEAR_COL}' not found. "
         f"Available columns: {list(df.columns)}"
     )
 
@@ -88,7 +60,9 @@ print(f"  Years in file : {sorted(df[YEAR_COL].unique())}")
 print(f"  Teams in file : {sorted(df['team'].unique())}")
 print(f"  Wins range    : {df['reg_season_wins'].min()} – {df['reg_season_wins'].max()}")
 
-# ── Detect and remove rows with no player stats ────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  Drop rows with no player stats
+# ══════════════════════════════════════════════════════════════════════════════
 stat_cols_check = [
     c for c in df.columns
     if any(c.startswith(f"p{i}_") for i in range(1, N_PLAYERS + 1))
@@ -115,7 +89,9 @@ else:
 df_clean = df[complete_mask].copy()
 print(f"\n  Usable rows: {len(df_clean)} (dropped {n_empty})")
 
-# ── Apply year-based splits ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  Apply year-based splits
+# ══════════════════════════════════════════════════════════════════════════════
 train_mask = df_clean[YEAR_COL].isin(TRAIN_YEARS)
 val_mask   = df_clean[YEAR_COL].isin(VAL_YEARS)
 test_mask  = df_clean[YEAR_COL].isin(TEST_YEARS)
@@ -131,14 +107,13 @@ for label, mask, years in [
     status = f"{count:>3} rows ✓" if count > 0 else "⚠  NO ROWS — check YEAR_COL name/values"
     print(f"  {label:<9}: years {yr_str}  →  {status}")
 
-# Warn about any years in the CSV that fall outside all three splits
-all_assigned = train_mask | val_mask | test_mask
-unassigned   = df_clean[~all_assigned][YEAR_COL].unique()
+unassigned = df_clean[~(train_mask | val_mask | test_mask)][YEAR_COL].unique()
 if len(unassigned):
     print(f"\n  ℹ  Years not assigned to any split (ignored): {sorted(unassigned)}")
-    print(f"     These are 2010–2014 seasons sitting between eras — intentionally excluded.")
 
-# ── Define feature columns ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  Define feature columns
+# ══════════════════════════════════════════════════════════════════════════════
 NAME_COLS = [c for c in df.columns if c.endswith("_name")]
 META_COLS = [
     YEAR_COL, "split", "team", "reg_season_wins", "reg_losses",
@@ -158,11 +133,10 @@ ALLOWED_SLOTS = set(
 )
 
 DROPPED_BY_MASK = set()
-if DROP_PLAYER_COLS:
-    for suffix in DROP_PLAYER_COLS:
-        for i in range(1, N_PLAYERS + 1):
-            DROPPED_BY_MASK.add(f"p{i}_{suffix}")
-    print(f"\n  Dropping {len(DROPPED_BY_MASK)} columns via dropout mask.")
+for suffix in DROP_PLAYER_COLS:
+    for i in range(1, N_PLAYERS + 1):
+        DROPPED_BY_MASK.add(f"p{i}_{suffix}")
+print(f"\n  Dropping {len(DROPPED_BY_MASK)} columns via dropout mask.")
 
 FEAT_COLS = [
     c for c in df_clean.columns
@@ -171,9 +145,11 @@ FEAT_COLS = [
     and df_clean[c].dtype in ["float64", "int64"]
     and (c not in ALL_PLAYER_SLOTS or c in ALLOWED_SLOTS)
 ]
-print(f"\n  Feature columns: {len(FEAT_COLS)}  (using {N_PLAYERS} player slots)")
+print(f"  Feature columns: {len(FEAT_COLS)}  (using {N_PLAYERS} player slots)")
 
-# ── Build splits ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.  Build split arrays
+# ══════════════════════════════════════════════════════════════════════════════
 X_train = df_clean.loc[train_mask, FEAT_COLS].fillna(0)
 y_train = df_clean.loc[train_mask, "reg_season_wins"]
 
@@ -184,10 +160,12 @@ X_test  = df_clean.loc[test_mask,  FEAT_COLS].fillna(0)
 y_test  = df_clean.loc[test_mask,  "reg_season_wins"]
 
 print(f"\n  Train  : {len(X_train):>3} rows  ({min(TRAIN_YEARS)}–{max(TRAIN_YEARS)})")
-print(f"  Val    : {len(X_val):>3} rows  ({min(VAL_YEARS)}–{max(VAL_YEARS)})")
+print(f"  Val    : {len(X_val):>3} rows  ({VAL_YEARS[0]})")
 print(f"  Test   : {len(X_test):>3} rows  ({min(TEST_YEARS)}–{max(TEST_YEARS)})")
 
-# ── Train XGBoost ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  Train XGBoost
+# ══════════════════════════════════════════════════════════════════════════════
 print("\nTraining XGBoost...")
 
 model = XGBRegressor(
@@ -209,11 +187,12 @@ model.fit(
     verbose=100,
 )
 
-# ── Evaluate ───────────────────────────────────────────────────────────────────
-import matplotlib.pyplot as plt
-import matplotlib.lines as mlines
+# ══════════════════════════════════════════════════════════════════════════════
+# 7.  Evaluation helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
 def report(label, X, y, df_rows, plot=False):
+    """Print MAE/R² and optionally produce an actual-vs-predicted scatter."""
     preds = model.predict(X)
     mae   = mean_absolute_error(y, preds)
     r2    = r2_score(y, preds)
@@ -226,98 +205,215 @@ def report(label, X, y, df_rows, plot=False):
     results["error"]     = np.round(preds - y.values, 1)
 
     if not plot:
-        return
+        return results
 
     plot_data = sorted(
         zip(results["team"], results[YEAR_COL],
             results["reg_season_wins"], results["predicted"]),
         key=lambda x: x[3]
     )
-    # Label as "TEAM·YEAR" so duplicate teams across seasons are distinguishable
     teams     = [f"{d[0]}·{d[1]}" for d in plot_data]
     actual    = np.array([d[2] for d in plot_data])
     predicted = np.array([d[3] for d in plot_data])
     x         = np.arange(len(teams))
 
-    BG_COLOR      = "#0d1117"
-    PANEL_COLOR   = "#161b22"
-    GRID_COLOR    = "#21262d"
-    ACTUAL_COLOR  = "#3fb950"
-    PREDICT_COLOR = "#f85149"
-    TEXT_COLOR    = "#e6edf3"
-    SUBTEXT_COLOR = "#8b949e"
+    BG, PANEL, GRID = "#0d1117", "#161b22", "#21262d"
+    ACT, PRED, TEXT = "#3fb950", "#f85149", "#e6edf3"
+    SUB             = "#8b949e"
 
     fig, ax = plt.subplots(figsize=(max(20, len(teams) * 0.45), 9))
-    fig.patch.set_facecolor(BG_COLOR)
-    ax.set_facecolor(PANEL_COLOR)
+    fig.patch.set_facecolor(BG);  ax.set_facecolor(PANEL)
 
     for i in range(len(teams)):
         ax.plot([x[i], x[i]], [predicted[i], actual[i]],
                 color="white", alpha=0.35, linewidth=1.4,
                 linestyle=(0, (3, 3)), zorder=2)
 
-    ax.scatter(x, predicted, color=PREDICT_COLOR, s=90, zorder=4,
+    ax.scatter(x, predicted, color=PRED, s=90, zorder=4,
                edgecolors="white", linewidths=0.6)
-    ax.scatter(x, actual,    color=ACTUAL_COLOR,  s=90, zorder=4,
+    ax.scatter(x, actual,    color=ACT,  s=90, zorder=4,
                edgecolors="white", linewidths=0.6)
 
     ax.set_axisbelow(True)
-    ax.yaxis.grid(True, color=GRID_COLOR, linewidth=0.8, linestyle="--")
+    ax.yaxis.grid(True, color=GRID, linewidth=0.8, linestyle="--")
     ax.xaxis.grid(False)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.tick_params(colors=SUBTEXT_COLOR, length=0)
-
+    for spine in ax.spines.values(): spine.set_visible(False)
+    ax.tick_params(colors=SUB, length=0)
     ax.set_xticks(x)
     ax.set_xticklabels(teams, rotation=45, ha="right",
-                       fontsize=7, color=TEXT_COLOR, fontfamily="monospace")
-    ax.set_ylabel("Wins", color=TEXT_COLOR, fontsize=12, labelpad=10)
-    ax.yaxis.set_tick_params(labelcolor=SUBTEXT_COLOR, labelsize=10)
+                       fontsize=7, color=TEXT, fontfamily="monospace")
+    ax.set_ylabel("Wins", color=TEXT, fontsize=12, labelpad=10)
+    ax.yaxis.set_tick_params(labelcolor=SUB, labelsize=10)
     ax.set_xlim(-0.7, len(teams) - 0.3)
     ax.set_ylim(0, max(actual.max(), predicted.max()) + 8)
 
     fig.text(0.5, 0.97, f"NBA {label.strip()} — Actual vs Expected Wins",
-             ha="center", va="top", fontsize=18, fontweight="bold", color=TEXT_COLOR)
+             ha="center", va="top", fontsize=18, fontweight="bold", color=TEXT)
     fig.text(0.5, 0.925,
              f"Sorted by expected wins  ·  MAE: {mae:.2f}  ·  R²: {r2:.3f}",
-             ha="center", va="top", fontsize=10, color=SUBTEXT_COLOR)
+             ha="center", va="top", fontsize=10, color=SUB)
 
-    pred_handle = mlines.Line2D([], [], color=PREDICT_COLOR, marker='o',
-                                markersize=8, linestyle='None',
-                                markeredgecolor='white', markeredgewidth=0.6,
-                                label='Expected Wins')
-    act_handle  = mlines.Line2D([], [], color=ACTUAL_COLOR, marker='o',
-                                markersize=8, linestyle='None',
-                                markeredgecolor='white', markeredgewidth=0.6,
-                                label='Actual Wins')
-    ax.legend(handles=[pred_handle, act_handle], loc="upper left",
-              framealpha=0.2, facecolor=PANEL_COLOR,
-              edgecolor=GRID_COLOR, labelcolor=TEXT_COLOR, fontsize=10)
+    pred_h = mlines.Line2D([], [], color=PRED, marker='o', markersize=8,
+                           linestyle='None', markeredgecolor='white',
+                           markeredgewidth=0.6, label='Expected Wins')
+    act_h  = mlines.Line2D([], [], color=ACT,  marker='o', markersize=8,
+                           linestyle='None', markeredgecolor='white',
+                           markeredgewidth=0.6, label='Actual Wins')
+    ax.legend(handles=[pred_h, act_h], loc="upper left", framealpha=0.2,
+              facecolor=PANEL, edgecolor=GRID, labelcolor=TEXT, fontsize=10)
 
     plt.tight_layout(rect=[0, 0, 1, 0.93])
-    safe_label = label.strip().replace(" ", "_").replace("/", "-")
-    plt.savefig(f"report_{safe_label}.png", dpi=160,
-                bbox_inches="tight", facecolor=BG_COLOR)
+    safe = label.strip().replace(" ", "_").replace("/", "-")
+    plt.savefig(f"report_{safe}.png", dpi=160, bbox_inches="tight", facecolor=BG)
     plt.show()
+    return results
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 8.  Evaluate train / val
+# ══════════════════════════════════════════════════════════════════════════════
 print("\n══ Evaluation ══════════════════════════════════════════")
-report("Train (2017–2025)", X_train, y_train, df_clean[train_mask])
-report("Val   (2015–2016)", X_val,   y_val,   df_clean[val_mask], plot=True)
+report("Train (2016–2023)", X_train, y_train, df_clean[train_mask])
+report("Val (2024)",        X_val,   y_val,   df_clean[val_mask], plot=True)
 
-# ── Old-era test — uncomment when you're satisfied with val ───────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 9.  Old-era test  (touched once — final evaluation only)
+# ══════════════════════════════════════════════════════════════════════════════
 print("\n  ⚠  Running old-era test evaluation — do this only once!")
-report("Test (2003–2009)", X_test, y_test, df_clean[test_mask], plot=True)
+test_results = report("Test (2003–2010)", X_test, y_test,
+                      df_clean[test_mask], plot=True)
 
-# ── Feature importance ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 10.  Per-season MAE line chart  (2003–2010)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n══ Per-Season MAE (old-era test) ════════════════════════")
+
+# Attach predictions back to the test rows so we can group by season
+test_preds = model.predict(X_test)
+test_rows  = df_clean[test_mask].copy().reset_index(drop=True)
+test_rows["predicted"] = test_preds
+test_rows["abs_error"] = np.abs(test_rows["predicted"] - test_rows["reg_season_wins"])
+
+season_mae = (
+    test_rows.groupby(YEAR_COL)["abs_error"]
+    .mean()
+    .reset_index()
+    .rename(columns={"abs_error": "mae"})
+    .sort_values(YEAR_COL)
+)
+
+# Also compute season-level R² for the subtitle annotation
+season_r2 = (
+    test_rows.groupby(YEAR_COL)
+    .apply(lambda g: r2_score(g["reg_season_wins"], g["predicted"]))
+    .reset_index()
+    .rename(columns={0: "r2"})
+    .sort_values(YEAR_COL)
+)
+
+season_stats = season_mae.merge(season_r2, on=YEAR_COL)
+print(f"\n  {'Season':<8} {'MAE':>6} {'R²':>7} {'Teams':>6}")
+print("  " + "─" * 32)
+for _, row in season_stats.iterrows():
+    n_teams = (test_rows[YEAR_COL] == row[YEAR_COL]).sum()
+    print(f"  {int(row[YEAR_COL]):<8} {row['mae']:>6.2f} {row['r2']:>7.3f} {n_teams:>6}")
+
+overall_mae = season_mae["mae"].mean()
+print(f"\n  Overall old-era MAE (mean of season MAEs): {overall_mae:.2f} wins")
+
+# ── Line chart ────────────────────────────────────────────────────────────────
+seasons  = season_stats[YEAR_COL].astype(int).tolist()
+mae_vals = season_stats["mae"].tolist()
+r2_vals  = season_stats["r2"].tolist()
+
+# Colour constants — white background, readable
+LINE_C   = "#1565C0"   # blue line / markers
+FILL_C   = "#BBDEFB"   # light-blue fill under curve
+AVG_C    = "#C62828"   # red dashed average line
+GRID_C   = "#E0E0E0"
+TEXT_C   = "#212121"
+SUB_C    = "#616161"
+
+fig, ax = plt.subplots(figsize=(10, 6))
+fig.patch.set_facecolor("white")
+ax.set_facecolor("white")
+
+# Shaded area under the MAE curve
+ax.fill_between(seasons, mae_vals, alpha=0.18, color=FILL_C, zorder=1)
+
+# MAE line + markers
+ax.plot(seasons, mae_vals,
+        color=LINE_C, linewidth=2.5, marker="o",
+        markersize=9, markerfacecolor=LINE_C,
+        markeredgecolor="white", markeredgewidth=1.5,
+        zorder=3, label="Per-season MAE")
+
+# Annotate each point: MAE value above, R² below
+for sx, my, ry in zip(seasons, mae_vals, r2_vals):
+    ax.annotate(f"{my:.2f}",
+                xy=(sx, my), xytext=(0, 11),
+                textcoords="offset points",
+                ha="center", va="bottom",
+                fontsize=9.5, fontweight="bold", color=LINE_C)
+    ax.annotate(f"R²={ry:.2f}",
+                xy=(sx, my), xytext=(0, -16),
+                textcoords="offset points",
+                ha="center", va="top",
+                fontsize=8, color=SUB_C)
+
+# Overall-average reference line
+ax.axhline(overall_mae, color=AVG_C, linewidth=1.6,
+           linestyle="--", zorder=2,
+           label=f"Mean MAE = {overall_mae:.2f} wins")
+
+# Grid + spines
+ax.set_axisbelow(True)
+ax.yaxis.grid(True, color=GRID_C, linewidth=0.9, linestyle="--")
+ax.xaxis.grid(False)
+for side, spine in ax.spines.items():
+    spine.set_visible(side in ("bottom", "left"))
+    if side in ("bottom", "left"):
+        spine.set_color(GRID_C)
+
+ax.tick_params(axis="both", length=0, labelcolor=TEXT_C)
+ax.set_xticks(seasons)
+ax.set_xticklabels([str(s) for s in seasons], fontsize=10, color=TEXT_C)
+ax.set_yticks(np.arange(0, max(mae_vals) + 3, 1))
+ax.yaxis.set_tick_params(labelsize=10, labelcolor=SUB_C)
+
+# Y-axis lower bound: always 0 so the scale isn't misleadingly zoomed
+ax.set_ylim(0, max(mae_vals) + 3.5)
+ax.set_xlim(min(seasons) - 0.4, max(seasons) + 0.4)
+
+ax.set_xlabel("Season", fontsize=12, color=TEXT_C, labelpad=8)
+ax.set_ylabel("Mean Absolute Error (wins)", fontsize=12, color=TEXT_C, labelpad=8)
+ax.set_title("Per-Season MAE — Old-Era Test (2003–2010)\n"
+             "Model trained on 2016–2023, validated on 2024",
+             fontsize=14, fontweight="bold", color=TEXT_C, pad=12)
+
+ax.legend(loc="upper right", frameon=True, framealpha=0.9,
+          facecolor="white", edgecolor=GRID_C,
+          labelcolor=TEXT_C, fontsize=10)
+
+plt.tight_layout()
+plt.savefig("report_old_era_mae_by_season.png", dpi=160,
+            bbox_inches="tight", facecolor="white")
+plt.show()
+print("  Saved: report_old_era_mae_by_season.png")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 11.  Feature importance
+# ══════════════════════════════════════════════════════════════════════════════
 importances = pd.Series(model.feature_importances_, index=FEAT_COLS)
 top20 = importances.nlargest(20)
 print("\n══ Top 20 Features ══════════════════════════════════════")
 for feat, imp in top20.items():
     print(f"  {feat:<40} {imp:.4f}")
 
-# ── Save artifacts ─────────────────────────────────────────────────────────────
-model_path    = os.path.join(OUTPUT_DIR, "xgb_model.pkl")
-features_path = os.path.join(OUTPUT_DIR, "feature_cols.json")
+# ══════════════════════════════════════════════════════════════════════════════
+# 12.  Save model artifacts
+# ══════════════════════════════════════════════════════════════════════════════
+model_path    = os.path.join(OUTPUT_DIR, "xgb_model_old_era.pkl")
+features_path = os.path.join(OUTPUT_DIR, "feature_cols_old_era.json")
 
 with open(model_path, "wb") as f:
     pickle.dump(model, f)
