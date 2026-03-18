@@ -25,11 +25,11 @@ from datetime import datetime
 # ─────────────────────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────────────
-FIRST_SEASON   = 2018  # Adjust down if probe confirms earlier seasons work
-CURRENT_SEASON = 2018
+FIRST_SEASON   = 2003  # Adjust down if probe confirms earlier seasons work
+CURRENT_SEASON = 2025
 TOP_N_PLAYERS  = 10
 MIN_GAMES      = 10
-OUTPUT_DIR     = "nba_data"
+OUTPUT_DIR     = "nba_data_2"
 RATE_LIMIT_SEC = 1.0
 # ─────────────────────────────────────────────────────────────
 
@@ -236,9 +236,25 @@ def merge_totals_and_advanced(tot: pd.DataFrame, adv: pd.DataFrame) -> pd.DataFr
         return tot
     join_keys = [k for k in ['playerName', '_team', '_season']
                  if k in tot.columns and k in adv.columns]
+
+    def _dedupe(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        non_keys = [c for c in df.columns if c not in join_keys]
+        agg = {}
+        for c in non_keys:
+            if pd.api.types.is_numeric_dtype(df[c]):
+                agg[c] = 'sum'
+            else:
+                agg[c] = 'first'
+        return df.groupby(join_keys, as_index=False).agg(agg)
+
+    tot_clean = _dedupe(tot)
+    adv_clean = _dedupe(adv)
+
     overlap = (set(tot.columns) & set(adv.columns)) - set(join_keys)
-    adv_slim = adv.drop(columns=list(overlap), errors='ignore')
-    return tot.merge(adv_slim, on=join_keys, how='outer')
+    adv_slim = adv_clean.drop(columns=list(overlap), errors='ignore')
+    return tot_clean.merge(adv_slim, on=join_keys, how='outer')
 
 
 def sort_and_trim(df: pd.DataFrame) -> pd.DataFrame:
@@ -340,13 +356,13 @@ def process_team_season(espn_team: str, season: int, standings: dict) -> dict:
             'reg_losses': reg_losses if reg_losses >= 0 else np.nan,
         }
 
-    players = merge_totals_and_advanced(tot_df, adv_df)
-    players = filter_min_games(players)
-    players = sort_and_trim(players)
+    players1 = merge_totals_and_advanced(tot_df, adv_df)
+    players2 = filter_min_games(players1)
+    players3 = sort_and_trim(players2)
 
     reg_wins, reg_losses = lookup_standing(espn_team, season, standings)
-    row = build_ml_row(espn_team, season, players, reg_wins, reg_losses)
-    print(f"{reg_wins}W / {reg_losses}L  |  {len(players)} players")
+    row = build_ml_row(espn_team, season, players3, reg_wins, reg_losses)
+    print(f"{reg_wins}W / {reg_losses}L  |  {len(players3)} players")
     return row
 
 
